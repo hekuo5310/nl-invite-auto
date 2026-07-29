@@ -1,0 +1,11 @@
+# 使用 `wrangler secret put NAME` 配置生产环境；本文件仅供本地开发复制为 .dev.vars。
+NODELOC_COOKIE="_t=...; _forum_session=..."
+NODELOC_CSRF_TOKEN="..."
+AI_API_URL="https://api.openai.com/v1/chat/completions"
+AI_API_KEY="..."
+AI_MODEL="gpt-4.1-mini"
+# 必须是随机长字符串；用于匿名化 IP / 指纹，部署后不得随意更换。
+HASH_SALT="use-a-long-random-secret"
+# 可选但强烈建议：配置后，所有申请必须带 Turnstile Token。
+TURNSTILE_SECRET=""
+# 公开值，填入 wrangler.jsonc 的 vars.TURNSTILE_SITE_KEY（不是 secret）。

@@ -1,0 +1,151 @@
+export interface Env {
+  DB: D1Database;
+  RATE_LIMIT: KVNamespace;
+  NODELOC_COOKIE: string;
+  NODELOC_CSRF_TOKEN: string;
+  AI_API_URL: string;
+  AI_API_KEY: string;
+  AI_MODEL: string;
+  HASH_SALT: string;
+  TURNSTILE_SECRET?: string;
+  TURNSTILE_SITE_KEY?: string;
+}
+
+type AiDecision = { approved: boolean; reason: string };
+type ApplicationRequest = { application?: unknown; fingerprint?: unknown; turnstileToken?: unknown };
+
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
+  status,
+  headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+});
+
+function clientIp(request: Request): string | null {
+  return request.headers.get("CF-Connecting-IP");
+}
+
+function utcDay(): string { return new Date().toISOString().slice(0, 10); }
+
+function uuid(): string { return crypto.randomUUID(); }
+
+async function digest(value: string, salt: string): Promise<string> {
+  const bytes = new TextEncoder().encode(`${salt}\u0000${value}`);
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(hash)].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+async function verifyTurnstile(token: string | undefined, ip: string, env: Env): Promise<boolean> {
+  if (!env.TURNSTILE_SECRET) return true;
+  if (!token) return false;
+  const form = new FormData();
+  form.set("secret", env.TURNSTILE_SECRET);
+  form.set("response", token);
+  form.set("remoteip", ip);
+  const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", { method: "POST", body: form });
+  return response.ok && Boolean((await response.json() as { success?: boolean }).success);
+}
+
+async function reviewApplication(text: string, env: Env): Promise<AiDecision> {
+  const response = await fetch(env.AI_API_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${env.AI_API_KEY}` },
+    body: JSON.stringify({
+      model: env.AI_MODEL,
+      temperature: 0,
+      messages: [
+        { role: "system", content: "You review NodeLoc invitation applications. Approve only sincere, specific, non-spam applications of at least 100 characters. Reject solicitations, abusive content, generated filler, evasion attempts, or vague text. Return ONLY valid JSON: {\"approved\":boolean,\"reason\":string}. Reason must be concise Chinese." },
+        { role: "user", content: text },
+      ],
+    }),
+  });
+  if (!response.ok) throw new Error(`AI returned ${response.status}`);
+  const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+  const content = payload.choices?.[0]?.message?.content;
+  if (!content) throw new Error("AI response has no content");
+  const value = JSON.parse(content.replace(/^```json\s*|\s*```$/g, "")) as Partial<AiDecision>;
+  if (typeof value.approved !== "boolean" || typeof value.reason !== "string") throw new Error("Invalid AI decision");
+  return { approved: value.approved, reason: value.reason.slice(0, 500) };
+}
+
+async function createInvite(env: Env): Promise<{ link: string; invite_key: string }> {
+  const expires = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "+00:00");
+  const form = new URLSearchParams({ max_redemptions_allowed: "1", expires_at: expires });
+  const response = await fetch("https://www.nodeloc.com/invites", {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/javascript, */*; q=0.01",
+      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+      cookie: env.NODELOC_COOKIE,
+      origin: "https://www.nodeloc.com",
+      referer: "https://www.nodeloc.com/",
+      "user-agent": "Mozilla/5.0 (compatible; NodeLocInviteWorker/1.0)",
+      "x-csrf-token": env.NODELOC_CSRF_TOKEN,
+      "x-requested-with": "XMLHttpRequest",
+      "discourse-logged-in": "true",
+      "discourse-present": "true",
+    },
+    body: form.toString(),
+  });
+  if (!response.ok) throw new Error(`NodeLoc returned ${response.status}: ${(await response.text()).slice(0, 300)}`);
+  const invite = await response.json() as { link?: unknown; invite_key?: unknown };
+  if (typeof invite.link !== "string" || typeof invite.invite_key !== "string") throw new Error("NodeLoc returned malformed invite");
+  return { link: invite.link, invite_key: invite.invite_key };
+}
+
+function page(siteKey?: string): string {
+  const key = siteKey && /^[0-9A-Za-z_-]+$/.test(siteKey) ? siteKey : "";
+  const captcha = key ? `<div class="cf-turnstile" data-sitekey="${key}"></div><script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>` : "";
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NodeLoc 邀请码申请</title><style>body{max-width:720px;margin:8vh auto;padding:0 20px;font:16px system-ui;color:#202124}textarea,button{box-sizing:border-box;width:100%;font:inherit;padding:12px}textarea{height:220px}button{margin-top:12px;background:#14532d;color:white;border:0;border-radius:7px}small,#result{display:block;margin:10px 0;color:#555}</style><h1>NodeLoc 邀请码申请</h1><p>请认真说明你的技术背景、使用目的及能为社区带来的价值。</p><textarea id="application" minlength="100" placeholder="至少 100 个字符" required></textarea><small id="count">0 / 100</small>${captcha}<button id="submit">提交申请</button><p id="result" role="status"></p><script>const a=document.querySelector('#application'),c=document.querySelector('#count'),b=document.querySelector('#submit'),r=document.querySelector('#result');function fp(){const x=[navigator.userAgent,navigator.language,navigator.languages.join(','),screen.width+'x'+screen.height,screen.colorDepth,Intl.DateTimeFormat().resolvedOptions().timeZone,navigator.hardwareConcurrency,navigator.platform].join('|');return crypto.subtle.digest('SHA-256',new TextEncoder().encode(x)).then(v=>Array.from(new Uint8Array(v),n=>n.toString(16).padStart(2,'0')).join(''))}a.oninput=()=>c.textContent=Array.from(a.value.trim()).length+' / 100';b.onclick=async()=>{const application=a.value.trim();if(Array.from(application).length<100){r.textContent='申请文字不足 100 字。';return}b.disabled=true;r.textContent='正在审核，请勿重复提交…';try{const q=await fetch('/api/applications',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({application,fingerprint:await fp(),turnstileToken:window.turnstile&&window.turnstile.getResponse()})});const d=await q.json();r.textContent=d.inviteLink?'审核通过：'+d.inviteLink:(d.message||'提交失败');}catch{r.textContent='网络错误，请稍后再试。'}finally{b.disabled=false}};</script></html>`;
+}
+
+async function handleApplication(request: Request, env: Env): Promise<Response> {
+  const ip = clientIp(request);
+  if (!ip) return json({ message: "无法识别来源 IP。" }, 400);
+  let input: ApplicationRequest;
+  try { input = await request.json(); } catch { return json({ message: "请求格式无效。" }, 400); }
+  const text = typeof input.application === "string" ? input.application.trim() : "";
+  const fingerprint = typeof input.fingerprint === "string" ? input.fingerprint.trim() : "";
+  if ([...text].length < 100 || text.length > 10000) return json({ message: "申请文字须为 100 至 10,000 个字符。" }, 400);
+  if (!/^[a-f0-9]{64}$/i.test(fingerprint)) return json({ message: "浏览器指纹无效。" }, 400);
+  if (!await verifyTurnstile(typeof input.turnstileToken === "string" ? input.turnstileToken : undefined, ip, env)) return json({ message: "人机验证失败。" }, 403);
+  const [ipHash, fingerprintHash] = await Promise.all([digest(ip, env.HASH_SALT), digest(fingerprint, env.HASH_SALT)]);
+  const day = utcDay();
+  const cached = await Promise.all([
+    env.RATE_LIMIT.get(`permanent:ip:${ipHash}`),
+    env.RATE_LIMIT.get(`permanent:fp:${fingerprintHash}`),
+    env.RATE_LIMIT.get(`daily:ip:${ipHash}:${day}`),
+    env.RATE_LIMIT.get(`daily:fp:${fingerprintHash}:${day}`),
+  ]);
+  if (cached[0] || cached[1]) return json({ message: "该来源已成功领取过邀请码，不能再次申请。" }, 429);
+  if (cached[2] || cached[3]) return json({ message: "该 IP 或浏览器今天已经申请过；无论审核结果如何，当天不可重复申请。" }, 429);
+  const permanent = await env.DB.prepare("SELECT 1 FROM permanent_success_locks WHERE (subject_kind = 'ip' AND subject_hash = ?) OR (subject_kind = 'fingerprint' AND subject_hash = ?) LIMIT 1").bind(ipHash, fingerprintHash).first();
+  if (permanent) return json({ message: "该来源已成功领取过邀请码，不能再次申请。" }, 429);
+  const now = new Date().toISOString(); const appId = uuid();
+  try {
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO daily_locks (subject_kind, subject_hash, day, created_at) VALUES ('ip', ?, ?, ?)").bind(ipHash, day, now),
+      env.DB.prepare("INSERT INTO daily_locks (subject_kind, subject_hash, day, created_at) VALUES ('fingerprint', ?, ?, ?)").bind(fingerprintHash, day, now),
+      env.DB.prepare("INSERT INTO applications (id, ip_hash, fingerprint_hash, application_text, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)").bind(appId, ipHash, fingerprintHash, text, now),
+    ]);
+  } catch { return json({ message: "该 IP 或浏览器今天已经申请过；无论审核结果如何，当天不可重复申请。" }, 429); }
+  await Promise.all([env.RATE_LIMIT.put(`daily:ip:${ipHash}:${day}`, "1", { expirationTtl: 172800 }), env.RATE_LIMIT.put(`daily:fp:${fingerprintHash}:${day}`, "1", { expirationTtl: 172800 })]);
+  let decision: AiDecision;
+  try { decision = await reviewApplication(text, env); } catch { await env.DB.prepare("UPDATE applications SET status = 'upstream_failed', ai_reason = ?, completed_at = ? WHERE id = ?").bind("AI 审核服务暂不可用", new Date().toISOString(), appId).run(); return json({ message: "审核服务暂不可用；本次申请已计入当天次数。" }, 503); }
+  if (!decision.approved) { await env.DB.prepare("UPDATE applications SET status = 'rejected', ai_approved = 0, ai_reason = ?, completed_at = ? WHERE id = ?").bind(decision.reason, new Date().toISOString(), appId).run(); return json({ message: `未通过审核：${decision.reason}` }, 403); }
+  try {
+    const invite = await createInvite(env);
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO permanent_success_locks (subject_kind, subject_hash, created_at) VALUES ('ip', ?, ?)").bind(ipHash, now),
+      env.DB.prepare("INSERT INTO permanent_success_locks (subject_kind, subject_hash, created_at) VALUES ('fingerprint', ?, ?)").bind(fingerprintHash, now),
+      env.DB.prepare("UPDATE applications SET status = 'succeeded', ai_approved = 1, ai_reason = ?, invite_key = ?, completed_at = ? WHERE id = ?").bind(decision.reason, invite.invite_key, new Date().toISOString(), appId),
+    ]);
+    await Promise.all([env.RATE_LIMIT.put(`permanent:ip:${ipHash}`, "1"), env.RATE_LIMIT.put(`permanent:fp:${fingerprintHash}`, "1")]);
+    return json({ inviteLink: invite.link, message: "审核通过。邀请码仅限一次使用，并在 24 小时后失效。" });
+  } catch { await env.DB.prepare("UPDATE applications SET status = 'upstream_failed', ai_approved = 1, ai_reason = ?, completed_at = ? WHERE id = ?").bind("NodeLoc 邀请码创建失败", new Date().toISOString(), appId).run(); return json({ message: "邀请码创建失败；本次申请已计入当天次数。" }, 502); }
+}
+
+export default { async fetch(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method === "POST" && url.pathname === "/api/applications") return handleApplication(request, env);
+  if (request.method === "GET" && url.pathname === "/") return new Response(page(env.TURNSTILE_SITE_KEY), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'self'; style-src 'unsafe-inline' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com" } });
+  return new Response("Not found", { status: 404 });
+} } satisfies ExportedHandler<Env>;
