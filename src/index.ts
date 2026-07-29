@@ -91,6 +91,17 @@ async function createInvite(env: Env): Promise<{ link: string; invite_key: strin
   return { link: invite.link, invite_key: invite.invite_key };
 }
 
+async function releaseDailyLocks(env: Env, ipHash: string, fingerprintHash: string, day: string): Promise<void> {
+  await Promise.all([
+    env.DB.batch([
+      env.DB.prepare("DELETE FROM daily_locks WHERE subject_kind = 'ip' AND subject_hash = ? AND day = ?").bind(ipHash, day),
+      env.DB.prepare("DELETE FROM daily_locks WHERE subject_kind = 'fingerprint' AND subject_hash = ? AND day = ?").bind(fingerprintHash, day),
+    ]),
+    env.RATE_LIMIT.delete(`daily:ip:${ipHash}:${day}`),
+    env.RATE_LIMIT.delete(`daily:fp:${fingerprintHash}:${day}`),
+  ]);
+}
+
 function page(siteKey?: string): string {
   const key = siteKey && /^[0-9A-Za-z_-]+$/.test(siteKey) ? siteKey : "";
   const captcha = key ? `<div class="cf-turnstile" data-sitekey="${key}"></div><script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>` : "";
@@ -129,10 +140,19 @@ async function handleApplication(request: Request, env: Env): Promise<Response> 
   } catch { return json({ message: "该 IP 或浏览器今天已经申请过；无论审核结果如何，当天不可重复申请。" }, 429); }
   await Promise.all([env.RATE_LIMIT.put(`daily:ip:${ipHash}:${day}`, "1", { expirationTtl: 172800 }), env.RATE_LIMIT.put(`daily:fp:${fingerprintHash}:${day}`, "1", { expirationTtl: 172800 })]);
   let decision: AiDecision;
-  try { decision = await reviewApplication(text, env); } catch { await env.DB.prepare("UPDATE applications SET status = 'upstream_failed', ai_reason = ?, completed_at = ? WHERE id = ?").bind("AI 审核服务暂不可用", new Date().toISOString(), appId).run(); return json({ message: "审核服务暂不可用；本次申请已计入当天次数。" }, 503); }
+  try { decision = await reviewApplication(text, env); } catch {
+    await env.DB.prepare("UPDATE applications SET status = 'upstream_failed', ai_reason = ?, completed_at = ? WHERE id = ?").bind("AI 审核服务暂不可用", new Date().toISOString(), appId).run();
+    await releaseDailyLocks(env, ipHash, fingerprintHash, day);
+    return json({ message: "审核服务暂不可用；本次未计入申请次数，可稍后重试。" }, 503);
+  }
   if (!decision.approved) { await env.DB.prepare("UPDATE applications SET status = 'rejected', ai_approved = 0, ai_reason = ?, completed_at = ? WHERE id = ?").bind(decision.reason, new Date().toISOString(), appId).run(); return json({ message: `未通过审核：${decision.reason}` }, 403); }
+  let invite: { link: string; invite_key: string };
+  try { invite = await createInvite(env); } catch {
+    await env.DB.prepare("UPDATE applications SET status = 'upstream_failed', ai_approved = 1, ai_reason = ?, completed_at = ? WHERE id = ?").bind("NodeLoc 邀请码创建失败", new Date().toISOString(), appId).run();
+    await releaseDailyLocks(env, ipHash, fingerprintHash, day);
+    return json({ message: "邀请码创建失败；本次未计入申请次数，可稍后重试。" }, 502);
+  }
   try {
-    const invite = await createInvite(env);
     await env.DB.batch([
       env.DB.prepare("INSERT INTO permanent_success_locks (subject_kind, subject_hash, created_at) VALUES ('ip', ?, ?)").bind(ipHash, now),
       env.DB.prepare("INSERT INTO permanent_success_locks (subject_kind, subject_hash, created_at) VALUES ('fingerprint', ?, ?)").bind(fingerprintHash, now),
@@ -140,7 +160,7 @@ async function handleApplication(request: Request, env: Env): Promise<Response> 
     ]);
     await Promise.all([env.RATE_LIMIT.put(`permanent:ip:${ipHash}`, "1"), env.RATE_LIMIT.put(`permanent:fp:${fingerprintHash}`, "1")]);
     return json({ inviteLink: invite.link, message: "审核通过。邀请码仅限一次使用，并在 24 小时后失效。" });
-  } catch { await env.DB.prepare("UPDATE applications SET status = 'upstream_failed', ai_approved = 1, ai_reason = ?, completed_at = ? WHERE id = ?").bind("NodeLoc 邀请码创建失败", new Date().toISOString(), appId).run(); return json({ message: "邀请码创建失败；本次申请已计入当天次数。" }, 502); }
+  } catch { await env.DB.prepare("UPDATE applications SET status = 'upstream_failed', ai_approved = 1, ai_reason = ?, completed_at = ? WHERE id = ?").bind("邀请码已创建，但永久锁记录失败", new Date().toISOString(), appId).run(); return json({ message: "邀请码已创建但记录失败，为避免重复发放，请勿重试。" }, 502); }
 }
 
 export default { async fetch(request: Request, env: Env): Promise<Response> {
