@@ -146,6 +146,6 @@ async function handleApplication(request: Request, env: Env): Promise<Response> 
 export default { async fetch(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   if (request.method === "POST" && url.pathname === "/api/applications") return handleApplication(request, env);
-  if (request.method === "GET" && url.pathname === "/") return new Response(page(env.TURNSTILE_SITE_KEY), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'self'; style-src 'unsafe-inline' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com" } });
+  if (request.method === "GET" && url.pathname === "/") return new Response(page(env.TURNSTILE_SITE_KEY), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; frame-src 'self' https://challenges.cloudflare.com" } });
   return new Response("Not found", { status: 404 });
 } } satisfies ExportedHandler<Env>;
