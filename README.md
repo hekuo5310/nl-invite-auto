@@ -1,6 +1,6 @@
 # NodeLoc 邀请码自动发放
 
-Cloudflare Workers + TypeScript + D1/KV 的申请系统。申请文字至少 100 个 Unicode 字符，经过 OpenAI 兼容接口审核后，通过 NodeLoc 的 Discourse `POST /invites` 创建一个单次使用、24 小时有效的邀请码。
+Cloudflare Workers + TypeScript + D1/KV 的申请系统。Worker 每天北京时间 08:00 通过 NodeLoc 创建一张当天有效、最多使用 3 次的邀请码；申请文字经 OpenAI 兼容接口审核后，前三位通过者获得同一链接。
 
 ## 部署
 
@@ -11,6 +11,8 @@ Cloudflare Workers + TypeScript + D1/KV 的申请系统。申请文字至少 100
 5. 按下文“配置 Secrets”逐项设置秘密。
 6. 推荐在 Cloudflare Turnstile 创建小组件，设置 `TURNSTILE_SECRET`，并将 site key 填入 `wrangler.jsonc` 的 `vars.TURNSTILE_SITE_KEY`。未配置时仍有 IP、设备指纹和 D1 限制，但无法有效阻挡自动化脚本。
 7. `npm run deploy`
+
+> 请在本地被忽略的 `wrangler.jsonc` 中加入 `"triggers": { "crons": ["0 0 * * *"] }`。Cloudflare Cron 使用 UTC，因此 `0 0 * * *` 即每天北京时间 08:00。
 
 Cookie 更新只需重新执行 `npx wrangler secret put NODELOC_COOKIE`；CSRF Token 失效时同样更新 `NODELOC_CSRF_TOKEN`。
 
@@ -72,3 +74,4 @@ https://your-ai-provider.example/v1/chat/completions
 - 在 AI 审核前先写入当天锁以阻止并发申请；AI 审核拒绝算一次。AI 服务异常或 NodeLoc 创建邀请码失败时会释放当天锁，允许稍后重试。
 - D1 是最终一致性与审计来源；KV 用于快速拦截。数据只保存加盐 SHA-256 哈希，不保存原始 IP/指纹。
 - 成功后写入两项永久锁；邀请码不会保存在日志或页面以外的明文数据库字段。
+- 每天只预创建一张最多使用 3 次的邀请码；数据库触发器强制最多向前三位审核通过者发放。

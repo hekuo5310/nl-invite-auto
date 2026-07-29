@@ -23,7 +23,11 @@ function clientIp(request: Request): string | null {
   return request.headers.get("CF-Connecting-IP");
 }
 
-function utcDay(): string { return new Date().toISOString().slice(0, 10); }
+function beijingDay(): string {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts();
+  const value = (type: string) => parts.find((part) => part.type === type)?.value;
+  return `${value("year")}-${value("month")}-${value("day")}`;
+}
 
 function uuid(): string { return crypto.randomUUID(); }
 
@@ -66,9 +70,8 @@ async function reviewApplication(text: string, env: Env): Promise<AiDecision> {
   return { approved: value.approved, reason: value.reason.slice(0, 500) };
 }
 
-async function createInvite(env: Env): Promise<{ link: string; invite_key: string }> {
-  const expires = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "+00:00");
-  const form = new URLSearchParams({ max_redemptions_allowed: "1", expires_at: expires });
+async function createInvite(env: Env, expires: string): Promise<{ link: string; invite_key: string }> {
+  const form = new URLSearchParams({ max_redemptions_allowed: "3", expires_at: expires });
   const response = await fetch("https://www.nodeloc.com/invites", {
     method: "POST",
     headers: {
@@ -91,6 +94,21 @@ async function createInvite(env: Env): Promise<{ link: string; invite_key: strin
   return { link: invite.link, invite_key: invite.invite_key };
 }
 
+type DailyInvite = { invite_link: string; invite_key: string };
+
+async function createDailyInvite(env: Env): Promise<void> {
+  const day = beijingDay();
+  const existing = await env.DB.prepare("SELECT 1 FROM daily_invites WHERE day = ?").bind(day).first();
+  if (existing) return;
+  const invite = await createInvite(env, `${day} 23:59+08:00`);
+  try {
+    await env.DB.prepare("INSERT INTO daily_invites (day, invite_key, invite_link, created_at, expires_at) VALUES (?, ?, ?, ?, ?)")
+      .bind(day, invite.invite_key, invite.link, new Date().toISOString(), `${day}T23:59:00+08:00`).run();
+  } catch {
+    // A duplicate cron delivery may have created the row first. The unused upstream invite expires naturally.
+  }
+}
+
 async function releaseDailyLocks(env: Env, ipHash: string, fingerprintHash: string, day: string): Promise<void> {
   await Promise.all([
     env.DB.batch([
@@ -105,7 +123,13 @@ async function releaseDailyLocks(env: Env, ipHash: string, fingerprintHash: stri
 function page(siteKey?: string): string {
   const key = siteKey && /^[0-9A-Za-z_-]+$/.test(siteKey) ? siteKey : "";
   const captcha = key ? `<div class="cf-turnstile" data-sitekey="${key}"></div><script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>` : "";
-  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NodeLoc 邀请码申请</title><style>body{max-width:720px;margin:8vh auto;padding:0 20px;font:16px system-ui;color:#202124}textarea,button{box-sizing:border-box;width:100%;font:inherit;padding:12px}textarea{height:220px}button{margin-top:12px;background:#14532d;color:white;border:0;border-radius:7px}button:disabled{background:#6b7280;cursor:not-allowed}small,#result{display:block;margin:10px 0;color:#555}</style><h1>NodeLoc 邀请码申请</h1><p>请认真说明你的技术背景、使用目的及能为社区带来的价值。</p><textarea id="application" minlength="100" placeholder="至少 100 个字符" required></textarea><small id="count">0 / 100</small>${captcha}<button id="submit">提交申请</button><p id="result" role="status"></p><script>const a=document.getElementById('application'),c=document.getElementById('count'),b=document.getElementById('submit'),r=document.getElementById('result');const updateCount=()=>{c.textContent=Array.from(a.value).length+' / 100'};a.addEventListener('input',updateCount);a.addEventListener('change',updateCount);updateCount();function fp(){const x=[navigator.userAgent,navigator.language,navigator.languages.join(','),screen.width+'x'+screen.height,screen.colorDepth,Intl.DateTimeFormat().resolvedOptions().timeZone,navigator.hardwareConcurrency,navigator.platform].join('|');return crypto.subtle.digest('SHA-256',new TextEncoder().encode(x)).then(v=>Array.from(new Uint8Array(v),n=>n.toString(16).padStart(2,'0')).join(''))}b.addEventListener('click',async()=>{const application=a.value.trim();if(Array.from(application).length<100){r.textContent='申请文字不足 100 字。';return}b.disabled=true;b.textContent='今日已提交';r.textContent='正在审核，请勿重复提交…';try{const q=await fetch('/api/applications',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({application,fingerprint:await fp(),turnstileToken:window.turnstile&&window.turnstile.getResponse()})});const d=await q.json();r.textContent=d.inviteLink?'审核通过：'+d.inviteLink:(d.message||'提交失败');}catch{r.textContent='网络错误；本次申请可能已计入当天次数，请勿重复提交。'}});</script></html>`;
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NodeLoc 邀请码申请</title><style>body{max-width:720px;margin:8vh auto;padding:0 20px;font:16px system-ui;color:#202124}textarea,button{box-sizing:border-box;width:100%;font:inherit;padding:12px}textarea{height:220px}button{margin-top:12px;background:#14532d;color:white;border:0;border-radius:7px}button:disabled{background:#6b7280;cursor:not-allowed}small,#result{display:block;margin:10px 0;color:#555}</style><h1>NodeLoc 邀请码申请</h1><p>请认真说明你的技术背景、使用目的及能为社区带来的价值。</p><textarea id="application" minlength="100" placeholder="至少 100 个字符" required></textarea><small id="count">0 / 100</small>${captcha}<button id="submit">提交申请</button><p id="result" role="status"></p><script>const a=document.getElementById('application'),c=document.getElementById('count'),b=document.getElementById('submit'),r=document.getElementById('result');const updateCount=()=>{c.textContent=Array.from(a.value).length+' / 100'};a.addEventListener('input',updateCount);a.addEventListener('change',updateCount);updateCount();fetch('/api/daily-status').then(x=>x.json()).then(s=>{if(s.exhausted){b.disabled=true;b.textContent='今日已领完';r.textContent='今日 3 个邀请码名额已全部发放。'}}).catch(()=>{});function fp(){const x=[navigator.userAgent,navigator.language,navigator.languages.join(','),screen.width+'x'+screen.height,screen.colorDepth,Intl.DateTimeFormat().resolvedOptions().timeZone,navigator.hardwareConcurrency,navigator.platform].join('|');return crypto.subtle.digest('SHA-256',new TextEncoder().encode(x)).then(v=>Array.from(new Uint8Array(v),n=>n.toString(16).padStart(2,'0')).join(''))}b.addEventListener('click',async()=>{const application=a.value.trim();if(Array.from(application).length<100){r.textContent='申请文字不足 100 字。';return}b.disabled=true;b.textContent='今日已提交';r.textContent='正在审核，请勿重复提交…';try{const q=await fetch('/api/applications',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({application,fingerprint:await fp(),turnstileToken:window.turnstile&&window.turnstile.getResponse()})});const d=await q.json();r.textContent=d.inviteLink?'审核通过：'+d.inviteLink:(d.message||'提交失败');}catch{r.textContent='网络错误；本次申请可能已计入当天次数，请勿重复提交。'}});</script></html>`;
+}
+
+async function dailyStatus(env: Env): Promise<Response> {
+  const day = beijingDay();
+  const result = await env.DB.prepare("SELECT COUNT(*) AS count FROM invite_claims WHERE day = ?").bind(day).first<{ count: number }>();
+  return json({ exhausted: (result?.count ?? 0) >= 3 });
 }
 
 async function handleApplication(request: Request, env: Env): Promise<Response> {
@@ -119,7 +143,7 @@ async function handleApplication(request: Request, env: Env): Promise<Response> 
   if (!/^[a-f0-9]{64}$/i.test(fingerprint)) return json({ message: "浏览器指纹无效。" }, 400);
   if (!await verifyTurnstile(typeof input.turnstileToken === "string" ? input.turnstileToken : undefined, ip, env)) return json({ message: "人机验证失败。" }, 403);
   const [ipHash, fingerprintHash] = await Promise.all([digest(ip, env.HASH_SALT), digest(fingerprint, env.HASH_SALT)]);
-  const day = utcDay();
+  const day = beijingDay();
   const cached = await Promise.all([
     env.RATE_LIMIT.get(`permanent:ip:${ipHash}`),
     env.RATE_LIMIT.get(`permanent:fp:${fingerprintHash}`),
@@ -146,26 +170,39 @@ async function handleApplication(request: Request, env: Env): Promise<Response> 
     return json({ message: "审核服务暂不可用；本次未计入申请次数，可稍后重试。" }, 503);
   }
   if (!decision.approved) { await env.DB.prepare("UPDATE applications SET status = 'rejected', ai_approved = 0, ai_reason = ?, completed_at = ? WHERE id = ?").bind(decision.reason, new Date().toISOString(), appId).run(); return json({ message: `未通过审核：${decision.reason}` }, 403); }
-  let invite: { link: string; invite_key: string };
-  try { invite = await createInvite(env); } catch {
-    await env.DB.prepare("UPDATE applications SET status = 'upstream_failed', ai_approved = 1, ai_reason = ?, completed_at = ? WHERE id = ?").bind("NodeLoc 邀请码创建失败", new Date().toISOString(), appId).run();
+  const dailyInvite = await env.DB.prepare("SELECT invite_link, invite_key FROM daily_invites WHERE day = ?").bind(day).first<DailyInvite>();
+  if (!dailyInvite) {
+    await env.DB.prepare("UPDATE applications SET status = 'upstream_failed', ai_approved = 1, ai_reason = ?, completed_at = ? WHERE id = ?").bind("当天邀请码尚未生成", new Date().toISOString(), appId).run();
     await releaseDailyLocks(env, ipHash, fingerprintHash, day);
-    return json({ message: "邀请码创建失败；本次未计入申请次数，可稍后重试。" }, 502);
+    return json({ message: "当天邀请码尚未生成；本次未计入申请次数，可稍后重试。" }, 503);
   }
   try {
+    await env.DB.prepare("INSERT INTO invite_claims (day, application_id, claimed_at) VALUES (?, ?, ?)").bind(day, appId, new Date().toISOString()).run();
     await env.DB.batch([
       env.DB.prepare("INSERT INTO permanent_success_locks (subject_kind, subject_hash, created_at) VALUES ('ip', ?, ?)").bind(ipHash, now),
       env.DB.prepare("INSERT INTO permanent_success_locks (subject_kind, subject_hash, created_at) VALUES ('fingerprint', ?, ?)").bind(fingerprintHash, now),
-      env.DB.prepare("UPDATE applications SET status = 'succeeded', ai_approved = 1, ai_reason = ?, invite_key = ?, completed_at = ? WHERE id = ?").bind(decision.reason, invite.invite_key, new Date().toISOString(), appId),
+      env.DB.prepare("UPDATE applications SET status = 'succeeded', ai_approved = 1, ai_reason = ?, invite_key = ?, completed_at = ? WHERE id = ?").bind(decision.reason, dailyInvite.invite_key, new Date().toISOString(), appId),
     ]);
     await Promise.all([env.RATE_LIMIT.put(`permanent:ip:${ipHash}`, "1"), env.RATE_LIMIT.put(`permanent:fp:${fingerprintHash}`, "1")]);
-    return json({ inviteLink: invite.link, message: "审核通过。邀请码仅限一次使用，并在 24 小时后失效。" });
-  } catch { await env.DB.prepare("UPDATE applications SET status = 'upstream_failed', ai_approved = 1, ai_reason = ?, completed_at = ? WHERE id = ?").bind("邀请码已创建，但永久锁记录失败", new Date().toISOString(), appId).run(); return json({ message: "邀请码已创建但记录失败，为避免重复发放，请勿重试。" }, 502); }
+    return json({ inviteLink: dailyInvite.invite_link, message: "审核通过。今日邀请码仅限 3 人使用，并在当天结束后失效。" });
+  } catch {
+    const claims = await env.DB.prepare("SELECT COUNT(*) AS count FROM invite_claims WHERE day = ?").bind(day).first<{ count: number }>();
+    if ((claims?.count ?? 0) >= 3) {
+      await env.DB.prepare("UPDATE applications SET status = 'rejected', ai_approved = 1, ai_reason = ?, completed_at = ? WHERE id = ?").bind("今日 3 个邀请码名额已发完", new Date().toISOString(), appId).run();
+      return json({ message: "审核通过，但今日 3 个邀请码名额已发完。" }, 409);
+    }
+    await env.DB.prepare("UPDATE applications SET status = 'upstream_failed', ai_approved = 1, ai_reason = ?, completed_at = ? WHERE id = ?").bind("邀请码名额分配失败", new Date().toISOString(), appId).run();
+    await releaseDailyLocks(env, ipHash, fingerprintHash, day);
+    return json({ message: "邀请码名额分配失败；本次未计入申请次数，可稍后重试。" }, 503);
+  }
 }
 
-export default { async fetch(request: Request, env: Env): Promise<Response> {
+export default { async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  ctx.waitUntil(createDailyInvite(env));
+}, async fetch(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   if (request.method === "POST" && url.pathname === "/api/applications") return handleApplication(request, env);
+  if (request.method === "GET" && url.pathname === "/api/daily-status") return dailyStatus(env);
   if (request.method === "GET" && url.pathname === "/") return new Response(page(env.TURNSTILE_SITE_KEY), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; frame-src 'self' https://challenges.cloudflare.com" } });
   return new Response("Not found", { status: 404 });
 } } satisfies ExportedHandler<Env>;

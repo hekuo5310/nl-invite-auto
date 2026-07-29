@@ -29,3 +29,27 @@ CREATE TABLE IF NOT EXISTS applications (
 );
 
 CREATE INDEX IF NOT EXISTS applications_created_at ON applications(created_at);
+
+-- 每日北京时间 08:00 创建的一张邀请码；所有当天获批者共享其链接。
+CREATE TABLE IF NOT EXISTS daily_invites (
+  day TEXT PRIMARY KEY,
+  invite_key TEXT NOT NULL,
+  invite_link TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS invite_claims (
+  day TEXT NOT NULL REFERENCES daily_invites(day),
+  application_id TEXT NOT NULL UNIQUE REFERENCES applications(id),
+  claimed_at TEXT NOT NULL,
+  PRIMARY KEY (day, application_id)
+);
+
+-- 数据库层硬限制每天最多三次发放，避免并发申请突破额度。
+CREATE TRIGGER IF NOT EXISTS limit_daily_invite_claims
+BEFORE INSERT ON invite_claims
+WHEN (SELECT COUNT(*) FROM invite_claims WHERE day = NEW.day) >= 3
+BEGIN
+  SELECT RAISE(ABORT, 'daily invite quota exhausted');
+END;
