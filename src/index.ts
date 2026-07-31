@@ -148,7 +148,11 @@ async function dailyStatus(env: Env): Promise<Response> {
 async function backfillDailyInvite(request: Request, env: Env): Promise<Response> {
   const token = request.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
   if (!await secureTokenMatches(token, env.ADMIN_TOKEN)) return new Response("Not found", { status: 404 });
-  await createDailyInvite(env);
+  try { await createDailyInvite(env); } catch (error) {
+    const message = error instanceof Error ? error.message.slice(0, 500) : "未知错误";
+    console.error("Manual daily invite backfill failed", { message });
+    return json({ message: `邀请码创建失败：${message}` }, 502);
+  }
   const invite = await env.DB.prepare("SELECT 1 FROM daily_invites WHERE day = ?").bind(beijingDay()).first();
   return invite ? json({ created: true, message: "当天邀请码已就绪。" }) : json({ message: "邀请码创建失败。" }, 502);
 }
