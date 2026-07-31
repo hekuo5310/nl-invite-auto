@@ -9,6 +9,7 @@ export interface Env {
   HASH_SALT: string;
   TURNSTILE_SECRET?: string;
   TURNSTILE_SITE_KEY?: string;
+  ADMIN_TOKEN?: string;
 }
 
 type AiDecision = { approved: boolean; reason: string };
@@ -35,6 +36,18 @@ async function digest(value: string, salt: string): Promise<string> {
   const bytes = new TextEncoder().encode(`${salt}\u0000${value}`);
   const hash = await crypto.subtle.digest("SHA-256", bytes);
   return [...new Uint8Array(hash)].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+async function secureTokenMatches(candidate: string | null, expected: string | undefined): Promise<boolean> {
+  if (!candidate || !expected) return false;
+  const [candidateHash, expectedHash] = await Promise.all([
+    crypto.subtle.digest("SHA-256", new TextEncoder().encode(candidate)),
+    crypto.subtle.digest("SHA-256", new TextEncoder().encode(expected)),
+  ]);
+  const left = new Uint8Array(candidateHash); const right = new Uint8Array(expectedHash);
+  let difference = left.length ^ right.length;
+  for (let i = 0; i < Math.max(left.length, right.length); i += 1) difference |= (left[i] ?? 0) ^ (right[i] ?? 0);
+  return difference === 0;
 }
 
 async function verifyTurnstile(token: string | undefined, ip: string, env: Env): Promise<boolean> {
@@ -132,6 +145,14 @@ async function dailyStatus(env: Env): Promise<Response> {
   return json({ exhausted: (result?.count ?? 0) >= 3 });
 }
 
+async function backfillDailyInvite(request: Request, env: Env): Promise<Response> {
+  const token = request.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
+  if (!await secureTokenMatches(token, env.ADMIN_TOKEN)) return new Response("Not found", { status: 404 });
+  await createDailyInvite(env);
+  const invite = await env.DB.prepare("SELECT 1 FROM daily_invites WHERE day = ?").bind(beijingDay()).first();
+  return invite ? json({ created: true, message: "当天邀请码已就绪。" }) : json({ message: "邀请码创建失败。" }, 502);
+}
+
 async function handleApplication(request: Request, env: Env): Promise<Response> {
   const ip = clientIp(request);
   if (!ip) return json({ message: "无法识别来源 IP。" }, 400);
@@ -202,6 +223,7 @@ export default { async scheduled(_controller: ScheduledController, env: Env, ctx
 }, async fetch(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   if (request.method === "POST" && url.pathname === "/api/applications") return handleApplication(request, env);
+  if (request.method === "POST" && url.pathname === "/internal/backfill-daily-invite") return backfillDailyInvite(request, env);
   if (request.method === "GET" && url.pathname === "/api/daily-status") return dailyStatus(env);
   if (request.method === "GET" && url.pathname === "/") return new Response(page(env.TURNSTILE_SITE_KEY), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; frame-src 'self' https://challenges.cloudflare.com" } });
   return new Response("Not found", { status: 404 });

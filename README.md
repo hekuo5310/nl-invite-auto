@@ -14,6 +14,8 @@ Cloudflare Workers + TypeScript + D1/KV 的申请系统。Worker 每天北京时
 
 > 请在本地被忽略的 `wrangler.jsonc` 中加入 `"triggers": { "crons": ["0 0 * * *"] }`。Cloudflare Cron 使用 UTC，因此 `0 0 * * *` 即每天北京时间 08:00。
 
+如果 Cron 未执行，可由管理员使用 `POST /internal/backfill-daily-invite` 手动补发。该接口必须设置 `ADMIN_TOKEN` Secret，并在 `Authorization: Bearer <ADMIN_TOKEN>` 中传入；它不会返回邀请码链接。
+
 Cookie 更新只需重新执行 `npx wrangler secret put NODELOC_COOKIE`；CSRF Token 失效时同样更新 `NODELOC_CSRF_TOKEN`。
 
 ## 配置 Secrets
