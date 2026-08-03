@@ -53,3 +53,26 @@ WHEN (SELECT COUNT(*) FROM invite_claims WHERE day = NEW.day) >= 3
 BEGIN
   SELECT RAISE(ABORT, 'daily invite quota exhausted');
 END;
+
+-- 新模式：每天创建 3 个单次邀请码，按 fetched_at 先进先出发放。
+CREATE TABLE IF NOT EXISTS pool_generation_slots (
+  source_day TEXT NOT NULL,
+  slot INTEGER NOT NULL CHECK(slot BETWEEN 1 AND 3),
+  state TEXT NOT NULL CHECK(state IN ('pending', 'creating', 'ready')),
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (source_day, slot)
+);
+
+CREATE TABLE IF NOT EXISTS invite_pool (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_day TEXT NOT NULL,
+  slot INTEGER NOT NULL CHECK(slot BETWEEN 1 AND 3),
+  invite_key TEXT NOT NULL UNIQUE,
+  invite_link TEXT NOT NULL,
+  fetched_at TEXT NOT NULL,
+  application_id TEXT UNIQUE REFERENCES applications(id),
+  claimed_at TEXT,
+  UNIQUE(source_day, slot)
+);
+
+CREATE INDEX IF NOT EXISTS invite_pool_fifo ON invite_pool(application_id, fetched_at, id);
