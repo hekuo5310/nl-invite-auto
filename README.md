@@ -16,11 +16,11 @@ Cloudflare Workers + TypeScript + D1/KV 的申请系统。Worker 每天北京时
 
 如果 Cron 未执行，可由管理员使用 `POST /internal/backfill-daily-invite` 手动补发。该接口必须设置 `ADMIN_TOKEN` Secret，并在 `Authorization: Bearer <ADMIN_TOKEN>` 中传入；它不会返回邀请码链接。
 
-Cookie 更新只需重新执行 `npx wrangler secret put NODELOC_COOKIE`；CSRF Token 失效时同样更新 `NODELOC_CSRF_TOKEN`。
+Cookie 更新后，只需更新 `NODELOC_COOKIE`；CSRF Token 失效时同样更新 `NODELOC_CSRF_TOKEN`。这两个绑定既可设为 Cloudflare Secret，也可设为普通 Variable，程序会以相同的变量名读取。
 
 ## 配置 Secrets
 
-所有敏感配置均通过 `wrangler secret put` 写入 Cloudflare，不要写进 `wrangler.jsonc`、`.dev.vars` 或 Git。每条命令会等待输入值；粘贴后回车保存。
+敏感配置建议通过 `wrangler secret put` 写入 Cloudflare，不要写进 `wrangler.jsonc`、`.dev.vars` 或 Git。每条命令会等待输入值；粘贴后回车保存。
 
 ```powershell
 npx wrangler secret put NODELOC_COOKIE
@@ -35,7 +35,9 @@ npx wrangler secret put HASH_SALT
 
 - `NODELOC_COOKIE`：浏览器开发者工具中请求的整个 `Cookie` 请求头，例如 `_t=...; _forum_session=...`。不要只填写其中一个 Cookie。
 - `NODELOC_CSRF_TOKEN`：同一已登录请求中的 `X-CSRF-Token` 请求头。Cookie 与 Token 应来自同一个登录会话。
-- Cookie 会过期或可被手动注销；更新后重新执行对应的 `wrangler secret put` 即可，不需要重新部署。
+- 可在 Cloudflare Dashboard 的 **Workers & Pages → 该 Worker → Settings → Variables and Secrets** 中，使用上述完全相同的名称创建普通 **Variable**；无需改代码或重新部署。程序也支持同名 **Secret**，后者更适合生产环境。
+- 若使用普通 Variable，后续用 Wrangler 部署时应使用 `npm run deploy -- --keep-vars`，避免部署配置覆盖 Dashboard 中已有的变量。
+- Cookie 会过期或可被手动注销；更新对应 Variable 或 Secret 即可，不需要重新部署。
 - 不要在 Git、截图、公开聊天或 issue 中发送 Cookie / CSRF Token；已经泄露时请退出 NodeLoc 后重新登录以使旧会话失效。
 
 ### AI 审核接口
