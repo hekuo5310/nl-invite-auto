@@ -145,7 +145,7 @@ async function refreshNodeLocSession(env: Env): Promise<void> {
     redirect: "manual",
   });
   if (await storeResponseUpdate(latest, "latest")) return;
-  const poll = await fetch("https://www.nodeloc.com/message-bus/9d607bd877df4ac998011268e27a6d3b/poll", {
+  const poll = await fetch("https://www.nodeloc.com/message-bus/9d607bd877df4ac998011268e27a6d3b/poll?dlp=t", {
     method: "POST",
     headers: {
       ...requestHeaders,
@@ -154,7 +154,7 @@ async function refreshNodeLocSession(env: Env): Promise<void> {
       referer: "https://www.nodeloc.com/",
       "x-requested-with": "XMLHttpRequest",
     },
-    body: "{}",
+    body: JSON.stringify({ __seq: 1 }),
     redirect: "manual",
   });
   await storeResponseUpdate(poll, "message-bus-poll");
