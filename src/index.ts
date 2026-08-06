@@ -14,6 +14,8 @@ export interface Env {
 
 type AiDecision = { approved: boolean; reason: string };
 type ApplicationRequest = { application?: unknown; fingerprint?: unknown; turnstileToken?: unknown };
+type NodeLocSession = { cookie: string; csrfToken: string };
+type StoredNodeLocSession = { encrypted_cookie: string; encrypted_csrf_token: string };
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
   status,
@@ -61,6 +63,103 @@ async function verifyTurnstile(token: string | undefined, ip: string, env: Env):
   return response.ok && Boolean((await response.json() as { success?: boolean }).success);
 }
 
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+async function sessionCryptoKey(env: Env): Promise<CryptoKey> {
+  const material = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`nodeloc-session-v1\u0000${env.HASH_SALT}`));
+  return crypto.subtle.importKey("raw", material, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
+async function encryptSessionValue(value: string, env: Env): Promise<string> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await sessionCryptoKey(env), new TextEncoder().encode(value));
+  return `${bytesToBase64(iv)}.${bytesToBase64(new Uint8Array(encrypted))}`;
+}
+
+async function decryptSessionValue(value: string, env: Env): Promise<string> {
+  const [encodedIv, encodedCiphertext] = value.split(".");
+  if (!encodedIv || !encodedCiphertext) throw new Error("Malformed stored NodeLoc session");
+  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv: base64ToBytes(encodedIv) }, await sessionCryptoKey(env), base64ToBytes(encodedCiphertext));
+  return new TextDecoder().decode(plaintext);
+}
+
+async function activeNodeLocSession(env: Env): Promise<NodeLocSession> {
+  const stored = await env.DB.prepare("SELECT encrypted_cookie, encrypted_csrf_token FROM nodeloc_session WHERE id = 'active'").first<StoredNodeLocSession>();
+  if (!stored) return { cookie: env.NODELOC_COOKIE, csrfToken: env.NODELOC_CSRF_TOKEN };
+  try {
+    return { cookie: await decryptSessionValue(stored.encrypted_cookie, env), csrfToken: await decryptSessionValue(stored.encrypted_csrf_token, env) };
+  } catch (error) {
+    console.warn("Ignoring unreadable stored NodeLoc session", { message: error instanceof Error ? error.message : "unknown" });
+    return { cookie: env.NODELOC_COOKIE, csrfToken: env.NODELOC_CSRF_TOKEN };
+  }
+}
+
+function mergeCookies(existing: string, setCookies: string[]): string {
+  const cookies = new Map<string, string>();
+  for (const part of existing.split(";")) {
+    const [name, ...value] = part.trim().split("=");
+    if (name && value.length) cookies.set(name, value.join("="));
+  }
+  for (const setCookie of setCookies) {
+    const [pair, ...attributes] = setCookie.split(";");
+    const [name, ...value] = pair.trim().split("=");
+    if (!name || !value.length) continue;
+    const expires = attributes.some((attribute) => /^\s*(max-age=0|expires=Thu, 01 Jan 1970)/i.test(attribute));
+    if (expires) cookies.delete(name); else cookies.set(name, value.join("="));
+  }
+  return [...cookies.entries()].map(([name, value]) => `${name}=${value}`).join("; ");
+}
+
+async function refreshNodeLocSession(env: Env): Promise<void> {
+  const current = await activeNodeLocSession(env);
+  const requestHeaders = {
+    accept: "application/json",
+    cookie: current.cookie,
+    "x-csrf-token": current.csrfToken,
+    "user-agent": "Mozilla/5.0 (compatible; NodeLocInviteWorker/1.0)",
+  };
+  const storeResponseUpdate = async (response: Response, source: string): Promise<boolean> => {
+    if (!response.ok) {
+      console.warn("NodeLoc session refresh returned a non-success response", { source, status: response.status });
+      return false;
+    }
+    const csrfToken = response.headers.get("x-csrf-token")?.trim() || current.csrfToken;
+    const cookie = mergeCookies(current.cookie, response.headers.getSetCookie());
+    if (cookie === current.cookie && csrfToken === current.csrfToken) return false;
+    await env.DB.prepare("INSERT INTO nodeloc_session (id, encrypted_cookie, encrypted_csrf_token, updated_at) VALUES ('active', ?, ?, ?) ON CONFLICT(id) DO UPDATE SET encrypted_cookie = excluded.encrypted_cookie, encrypted_csrf_token = excluded.encrypted_csrf_token, updated_at = excluded.updated_at")
+      .bind(await encryptSessionValue(cookie, env), await encryptSessionValue(csrfToken, env), new Date().toISOString()).run();
+    console.log("NodeLoc session refreshed", { source, cookieUpdated: cookie !== current.cookie, csrfUpdated: csrfToken !== current.csrfToken });
+    return true;
+  };
+  const latest = await fetch("https://www.nodeloc.com/latest.json", {
+    headers: requestHeaders,
+    redirect: "manual",
+  });
+  if (await storeResponseUpdate(latest, "latest")) return;
+  const poll = await fetch("https://www.nodeloc.com/message-bus/9d607bd877df4ac998011268e27a6d3b/poll", {
+    method: "POST",
+    headers: {
+      ...requestHeaders,
+      "content-type": "application/json",
+      origin: "https://www.nodeloc.com",
+      referer: "https://www.nodeloc.com/",
+      "x-requested-with": "XMLHttpRequest",
+    },
+    body: "{}",
+    redirect: "manual",
+  });
+  await storeResponseUpdate(poll, "message-bus-poll");
+}
+
 async function reviewApplication(text: string, env: Env): Promise<AiDecision> {
   const response = await fetch(env.AI_API_URL, {
     method: "POST",
@@ -84,17 +183,18 @@ async function reviewApplication(text: string, env: Env): Promise<AiDecision> {
 }
 
 async function createInvite(env: Env, expires: string, redemptions: string): Promise<{ link: string; invite_key: string }> {
+  const session = await activeNodeLocSession(env);
   const form = new URLSearchParams({ max_redemptions_allowed: redemptions, expires_at: expires });
   const response = await fetch("https://www.nodeloc.com/invites", {
     method: "POST",
     headers: {
       accept: "application/json, text/javascript, */*; q=0.01",
       "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-      cookie: env.NODELOC_COOKIE,
+      cookie: session.cookie,
       origin: "https://www.nodeloc.com",
       referer: "https://www.nodeloc.com/",
       "user-agent": "Mozilla/5.0 (compatible; NodeLocInviteWorker/1.0)",
-      "x-csrf-token": env.NODELOC_CSRF_TOKEN,
+      "x-csrf-token": session.csrfToken,
       "x-requested-with": "XMLHttpRequest",
       "discourse-logged-in": "true",
       "discourse-present": "true",
@@ -227,8 +327,13 @@ async function handleApplication(request: Request, env: Env): Promise<Response> 
   }
 }
 
-export default { async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-  ctx.waitUntil(fillDailyInvitePool(env));
+export default { async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  ctx.waitUntil((async () => {
+    try { await refreshNodeLocSession(env); } catch (error) {
+      console.error("NodeLoc session refresh failed", { message: error instanceof Error ? error.message : "unknown" });
+    }
+    if (controller.cron === "*/30 * * * *" && new Date().getUTCHours() === 0 && new Date().getUTCMinutes() === 0) await fillDailyInvitePool(env);
+  })());
 }, async fetch(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   if (request.method === "POST" && url.pathname === "/api/applications") return handleApplication(request, env);

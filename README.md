@@ -1,6 +1,6 @@
 # NodeLoc 邀请码自动发放
 
-Cloudflare Workers + TypeScript + D1/KV 的申请系统。Worker 每天北京时间 08:00 通过 NodeLoc 创建 3 张单次使用、有效至 9999-12-31 的邀请码，存入 D1 邀请码池；申请文字经 OpenAI 兼容接口审核后，按邀请码最早入池的顺序发放。
+Cloudflare Workers + TypeScript + D1/KV 的申请系统。Worker 每半小时访问一次 NodeLoc `latest.json` 以维持会话；每天北京时间 08:00 通过 NodeLoc 创建 3 张单次使用、有效至 9999-12-31 的邀请码，存入 D1 邀请码池；申请文字经 OpenAI 兼容接口审核后，按邀请码最早入池的顺序发放。
 
 ## 部署
 
@@ -12,7 +12,7 @@ Cloudflare Workers + TypeScript + D1/KV 的申请系统。Worker 每天北京时
 6. 推荐在 Cloudflare Turnstile 创建小组件，设置 `TURNSTILE_SECRET`，并将 site key 填入 `wrangler.jsonc` 的 `vars.TURNSTILE_SITE_KEY`。未配置时仍有 IP、设备指纹和 D1 限制，但无法有效阻挡自动化脚本。
 7. `npm run deploy`
 
-> 请在本地被忽略的 `wrangler.jsonc` 中加入 `"triggers": { "crons": ["0 0 * * *"] }`。Cloudflare Cron 使用 UTC，因此 `0 0 * * *` 即每天北京时间 08:00。
+> 请在本地被忽略的 `wrangler.jsonc` 中加入 `"triggers": { "crons": ["*/30 * * * *"] }`。Cloudflare Cron 使用 UTC；任务每半小时运行一次，并在 UTC 00:00（北京时间 08:00）先刷新会话再创建当天的邀请码。
 
 如果 Cron 未执行，可由管理员使用 `POST /internal/backfill-daily-invite` 手动补发。该接口必须设置 `ADMIN_TOKEN` Secret，并在 `Authorization: Bearer <ADMIN_TOKEN>` 中传入；它不会返回邀请码链接。
 
@@ -35,6 +35,7 @@ npx wrangler secret put HASH_SALT
 
 - `NODELOC_COOKIE`：浏览器开发者工具中请求的整个 `Cookie` 请求头，例如 `_t=...; _forum_session=...`。不要只填写其中一个 Cookie。
 - `NODELOC_CSRF_TOKEN`：同一已登录请求中的 `X-CSRF-Token` 请求头。Cookie 与 Token 应来自同一个登录会话。
+- 每半小时任务会先请求 `https://www.nodeloc.com/latest.json`。若响应没有下发新的 `Set-Cookie` 或 `X-CSRF-Token`，会继续 POST MessageBus poll 接口尝试刷新；两次响应均无更新时会继续使用现有凭据。会话副本在 D1 中加密保存，日志不会输出其内容。
 - 可在 Cloudflare Dashboard 的 **Workers & Pages → 该 Worker → Settings → Variables and Secrets** 中，使用上述完全相同的名称创建普通 **Variable**；无需改代码或重新部署。程序也支持同名 **Secret**，后者更适合生产环境。
 - 若使用普通 Variable，后续用 Wrangler 部署时应使用 `npm run deploy -- --keep-vars`，避免部署配置覆盖 Dashboard 中已有的变量。
 - Cookie 会过期或可被手动注销；更新对应 Variable 或 Secret 即可，不需要重新部署。

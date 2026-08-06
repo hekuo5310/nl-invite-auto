@@ -76,3 +76,11 @@ CREATE TABLE IF NOT EXISTS invite_pool (
 );
 
 CREATE INDEX IF NOT EXISTS invite_pool_fifo ON invite_pool(application_id, fetched_at, id);
+
+-- 最新的 NodeLoc 会话；敏感内容由 Worker 在写入前加密。
+CREATE TABLE IF NOT EXISTS nodeloc_session (
+  id TEXT PRIMARY KEY CHECK(id = 'active'),
+  encrypted_cookie TEXT NOT NULL,
+  encrypted_csrf_token TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
